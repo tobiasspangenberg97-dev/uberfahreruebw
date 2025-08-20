@@ -1,0 +1,185 @@
+# Benötigte Umgebungsvariablen im Konfigurieren-Tab:
+# VELOCITY_TRIPS_URL, VELOCITY_API_TOKEN
+# HQ_LAT, HQ_LNG, RADIUS_M, M_PER_DEG_LAT, M_PER_DEG_LON
+# MAIL_FROM_EMAIL, MAIL_FROM_NAME, MAIL_TO, MAILJET_B64
+# Das Workflow-Dienstkonto braucht die Rolle: Cloud Datastore User
+
+main:
+  steps:
+    # 1) Zeitraum: 12h zurück, damit der erste Trip des Tages sicher dabei ist
+    - calcSince:
+        assign:
+          - sinceTs: ${time.format(sys.now() - 12 * 60 * 60, "RFC3339")}
+
+    # 2) Trips von Velocity per API-Token holen
+    - fetchTrips:
+        call: http.get
+        args:
+          url: ${sys.get_env("VELOCITY_TRIPS_URL")}
+          headers:
+            Authorization: ${"Bearer " + sys.get_env("VELOCITY_API_TOKEN")}
+            Accept: "application/json"
+          query:
+            since: ${sinceTs}
+        result: tripsResp
+
+    # 3) Liste normalisieren
+    - normalize:
+        assign:
+          - trips: ${tripsResp.body}
+    - ensureList:
+        switch:
+          - condition: ${trips == null}
+            next: makeEmpty
+        next: countTrips
+    - makeEmpty:
+        assign:
+          - trips: []
+
+    - countTrips:
+        assign:
+          - tripCount: ${len(trips)}
+
+    - hasTrips:
+        switch:
+          - condition: ${tripCount > 0}
+            next: forEachTrip
+        next: finish
+
+    # 4) Pro Trip verarbeiten
+    - forEachTrip:
+        for:
+          value: trip
+          in: ${trips}
+          steps:
+            # Distanz zum HQ (planare Näherung; ohne trig-Funktionen)
+            - computeDistance:
+                assign:
+                  - dLatDeg: ${double(trip.start_lat) - double(sys.get_env("HQ_LAT"))}
+                  - dLonDeg: ${double(trip.start_lng) - double(sys.get_env("HQ_LNG"))}
+                  - dy: ${dLatDeg * double(sys.get_env("M_PER_DEG_LAT"))}   # Meter
+                  - dx: ${dLonDeg * double(sys.get_env("M_PER_DEG_LON"))}   # Meter
+                  - distSq: ${dx * dx + dy * dy}                            # m^2
+                  - radiusM: ${double(sys.get_env("RADIUS_M"))}
+                  - within: ${distSq <= radiusM * radiusM}
+                  - tripEpoch: ${double(time.parse(trip.start_time))}
+                  - nowRfc: ${time.format(sys.now(), "RFC3339")}
+                  - dateKey: ${text.split(nowRfc, "T")[0]}                  # YYYY-MM-DD
+                  - driverId: ${string(trip.driver_id)}
+                  - shiftDocId: ${driverId + "_" + dateKey}
+
+            # Schicht-Dokument laden oder (beim ersten Trip) anlegen
+            - getOrCreateShift:
+                try:
+                  steps:
+                    - fsGet:
+                        call: googleapis.firestore.v1.projects.databases.documents.get
+                        args:
+                          name: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT") +
+                                  "/databases/(default)/documents/driver_shifts/" + shiftDocId}
+                        result: fsDoc
+                    - loadShift:
+                        assign:
+                          - shiftStart: ${double(fsDoc.fields.shift_start_epoch.doubleValue ?? 0.0)}
+                          - hqSeen: ${fsDoc.fields.hq_seen.booleanValue ?? false}
+                          - notified: ${fsDoc.fields.notified.booleanValue ?? false}
+                except:
+                  as: e
+                  steps:
+                    - createShift:
+                        call: googleapis.firestore.v1.projects.databases.documents.createDocument
+                        args:
+                          parent: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT") + "/databases/(default)/documents"}
+                          collectionId: "driver_shifts"
+                          documentId: ${shiftDocId}
+                          body:
+                            fields:
+                              driver_id:
+                                stringValue: '${driverId}'
+                              date_key:
+                                stringValue: '${dateKey}'
+                              shift_start_epoch:
+                                doubleValue: ${tripEpoch}
+                              hq_seen:
+                                booleanValue: false
+                              notified:
+                                booleanValue: false
+                        result: fsCreated
+                    - initVars:
+                        assign:
+                          - shiftStart: ${tripEpoch}
+                          - hqSeen: false
+                          - notified: false
+
+            # Innerhalb der ersten 90 Min + im Radius -> hq_seen = true
+            - maybeSeeHQ:
+                switch:
+                  - condition: ${(tripEpoch - shiftStart) <= 90.0 * 60.0 && within == true && hqSeen == false}
+                    next: markSeen
+                next: maybeNotify
+
+            - markSeen:
+                call: googleapis.firestore.v1.projects.databases.documents.patch
+                args:
+                  name: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT") +
+                          "/databases/(default)/documents/driver_shifts/" + shiftDocId}
+                  updateMask.fieldPaths: ["hq_seen"]
+                  body:
+                    fields:
+                      hq_seen:
+                        booleanValue: true
+                result: fsUpdSeen
+
+            # 90 Min abgelaufen + kein HQ gesehen + noch nicht gemeldet -> Mail
+            - maybeNotify:
+                assign:
+                  - nowEpoch: ${double(sys.now())}
+                switch:
+                  - condition: ${(nowEpoch - shiftStart) >= 90.0 * 60.0 && hqSeen == false && notified == false}
+                    next: buildMail
+                next: afterTrip
+
+              # Betreff/Text stabil mit text.format bauen
+            - buildMail:
+                assign:
+                  - subjectLine: ${text.format("⚠ Fahrer {0} war 90 Min nach Schichtstart nicht am HQ", driverId)}
+                  - mailText: '${text.format("Fahrer: {0}\nSchichtstart (epoch): {1}\nTrip-ID: {2}\nStartzeit: {3}\nEntfernung² zum HQ (m²): {4}\nRadius (m): {5}", driverId, shiftStart, trip.trip_id, trip.start_time, int(distSq), int(radiusM))}'
+
+            - sendMail:
+                call: http.post
+                args:
+                  url: "https://api.mailjet.com/v3.1/send"
+                  headers:
+                    Content-Type: "application/json"
+                    Authorization: ${"Basic " + sys.get_env("MAILJET_B64")}
+                  body:
+                    Messages:
+                      - From:
+                          Email: ${sys.get_env("MAIL_FROM_EMAIL")}
+                          Name:  ${sys.get_env("MAIL_FROM_NAME")}
+                        To:
+                          - Email: ${sys.get_env("MAIL_TO")}
+                        Subject: ${subjectLine}
+                        TextPart: ${mailText}
+                result: mailResp
+
+            - markNotified:
+                call: googleapis.firestore.v1.projects.databases.documents.patch
+                args:
+                  name: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT") +
+                          "/databases/(default)/documents/driver_shifts/" + shiftDocId}
+                  updateMask.fieldPaths: ["notified"]
+                  body:
+                    fields:
+                      notified:
+                        booleanValue: true
+                result: fsUpdNotif
+
+            - afterTrip:
+                call: sys.log
+                args:
+                  text: ${text.format("Trip {0} | Driver {1} | within={2} | shiftStart={3}",
+                                      trip.trip_id, driverId, within, shiftStart)}
+
+    - finish:
+        return: ${text.format("OK – Trips: {0}", tripCount)}
